@@ -1,0 +1,33 @@
+[package]
+name = "dd_discord"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Web framework that focuses on ergonomics and modularity.
+axum = "0.7.4"
+tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
+twilight-model = "0.15.1"
+twilight-http = "0.15.4"
+twilight-util = { version = "0.15.1", features = ["builder"] }
+ed25519-dalek = {version = "2.0.0-pre.0", features = ["rand_core"]}
+hex = "0.4.3"
+reqwest = { version = "0.11.24", features = ["json"] }
+serde_json = "1.0.108"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
+ddclient-rs = "0.1.3"
+tokio-postgres = "0.7.10"
+redb = "1.4.0"
+serde = { version = "1.0.195", features = ["derive"] }
+uuid = { version = "1.6.1", features = ["v4", "fast-rng"] }
+http = "1.0.0"
+tracing-panic = "0.1.1"
+tokio-util =  {version = "0.7.10", features = ["rt"]}
+
+
+[dev-dependencies]
+rand = { version = "0.8.5", features = [] }
+httpmock = "0.7.0-rc.1"
