@@ -7,8 +7,8 @@ You can view Direct Decisions API v1 docs here: [https://api.directdecisions.com
 It enables direct democracy style polls/elections. Results are calculated using [Schulze method](https://en.wikipedia.org/wiki/Schulze_method).
 
 ## Features
-- Create votings
-- Delete votings
+- Create voting
+- Delete voting
 - Vote with a ballot
 - Complete voting and publish/follow results
 
@@ -16,7 +16,7 @@ It enables direct democracy style polls/elections. Results are calculated using 
 
 - OAuth & installation flow before publish
 - Voting management
-- Continious votings
+- Continuous voting
 - Improving UX
 
 ## Status
