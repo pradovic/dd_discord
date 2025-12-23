@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use dd_discord::{handle_interaction, InteractionError};
 use ddclient_rs::Voting;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signer as _, SigningKey};
 use httpmock::{Method::POST, MockServer};
 use rand::rngs::OsRng;
 
@@ -96,24 +96,25 @@ async fn handle_interaction_bad_signature() {
     let mut headers = http::HeaderMap::new();
     headers.insert("X-Signature-Ed25519", "bad signature".parse().unwrap());
     headers.insert("X-Signature-Timestamp", "bad timestamp".parse().unwrap());
-    let resp = handle_interaction(test.data.clone(), headers, test.body.to_string()).await;
+    let resp = handle_interaction(test.data.clone(), headers, test.body.clone()).await;
 
-    if let Err(InteractionError::Status(StatusCode::UNAUTHORIZED)) = resp {
+    if matches!(resp, Err(InteractionError::Status(StatusCode::UNAUTHORIZED))) {
     } else {
-        panic!("expected Unauthorized got {:?}", resp);
+        panic!("expected Unauthorized got {resp:?}");
     }
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "Integration test with comprehensive setup and assertions")]
 async fn handle_slash_interaction() {
     let test = setup_test_env("slash_command.json");
 
     let voting = Voting {
-        id: "4712947128794".to_string(),
+        id: "4712947128794".to_owned(),
         choices: vec![
-            "Spinoza".to_string(),
-            "Kant".to_string(),
-            "Nietzsche".to_string(),
+            "Spinoza".to_owned(),
+            "Kant".to_owned(),
+            "Nietzsche".to_owned(),
         ], // from slash_command.json
     };
 
@@ -125,8 +126,8 @@ async fn handle_slash_interaction() {
 
     let dd_client_happy_mocks = || -> Vec<(httpmock::Method, String, serde_json::Value)> {
         vec![(
-            httpmock::Method::POST,
-            "/v1/votings".to_string(),
+            POST,
+            "/v1/votings".to_owned(),
             serde_json::json!(&voting),
         )]
     };
@@ -135,7 +136,7 @@ async fn handle_slash_interaction() {
         vec![
             (
                 POST,
-                "/api/v10/users/@me/channels".to_string(),
+                "/api/v10/users/@me/channels".to_owned(),
                 json!({
                   "id": dm_channel_id,
                   "type": 1,
@@ -153,7 +154,7 @@ async fn handle_slash_interaction() {
             ),
             (
                 POST,
-                format!("/api/v10/channels/{}/messages", dm_channel_id),
+                format!("/api/v10/channels/{dm_channel_id}/messages"),
                 json!({
                             "attachments": [],
                             "author": {
@@ -179,7 +180,7 @@ async fn handle_slash_interaction() {
             ),
             (
                 POST,
-                format!("/api/v10/channels/{}/messages", channel_id),
+                format!("/api/v10/channels/{channel_id}/messages"),
                 json!({
                             "attachments": [],
                             "author": {
@@ -211,7 +212,7 @@ async fn handle_slash_interaction() {
       &test,
      dd_client_happy_mocks(),
      discord_client_happy_mocks(),
-      Ok((http::StatusCode::OK, Json(InteractionResponse{
+      Ok((StatusCode::OK, Json(InteractionResponse{
         kind: twilight_model::http::interaction::InteractionResponseType::ChannelMessageWithSource,
         data: None,
       }))), true);
@@ -219,13 +220,13 @@ async fn handle_slash_interaction() {
     let expected_voting = dd_discord::db::Voting {
         id: voting.id.clone(),
         choices: voting.choices.clone(),
-        channel_id: channel_id.to_string(),
-        message_id: message_id.to_string(),
-        name: "Who do you prefer?".to_string(), // from slash_command.json
+        channel_id: channel_id.to_owned(),
+        message_id: message_id.to_owned(),
+        name: "Who do you prefer?".to_owned(), // from slash_command.json
         is_completed: false,
         is_deleted: false,
-        creator_message_id: creator_message_id.to_string(),
-        creator_dm_channel_id: dm_channel_id.to_string(),
+        creator_message_id: creator_message_id.to_owned(),
+        creator_dm_channel_id: dm_channel_id.to_owned(),
     };
 
     let got_voting = test.data.db.get_voting(&voting.id).await.unwrap();
@@ -237,13 +238,13 @@ async fn handle_slash_interaction() {
     run_test!(
         "dd client create voting error",
         &test,
-        vec![(
+        [(
             POST,
-            "/v1/votings".to_string(),
+            "/v1/votings".to_owned(),
             json!({
               "error": "error",
             })
-        ),],
+        )],
         empty_mock_vec(),
         internal_server_error_response(),
         true
@@ -253,13 +254,13 @@ async fn handle_slash_interaction() {
         "discord client create private channel error",
         &test,
         dd_client_happy_mocks(),
-        vec![(
+        [(
             POST,
             "/api/v10/users/@me/channels",
             json!({
               "error": "error",
             })
-        ),],
+        )],
         internal_server_error_response(),
         true
     );
@@ -268,15 +269,15 @@ async fn handle_slash_interaction() {
         "discord client create dm message error",
         &test,
         dd_client_happy_mocks(),
-        vec![
+        [
             discord_client_happy_mocks().swap_remove(0),
             (
                 POST,
-                "/api/v10/channels/319674150115610528/messages".to_string(),
+                "/api/v10/channels/319674150115610528/messages".to_owned(),
                 json!({
                   "error": "error",
                 })
-            ),
+            )
         ],
         internal_server_error_response(),
         true
@@ -286,27 +287,28 @@ async fn handle_slash_interaction() {
         "discord client create channel message error",
         &test,
         dd_client_happy_mocks(),
-        vec![
+        [
             discord_client_happy_mocks().swap_remove(0),
             discord_client_happy_mocks().swap_remove(1),
             (
                 POST,
-                format!("/api/v10/channels/{}/messages", channel_id),
+                format!("/api/v10/channels/{channel_id}/messages"),
                 json!({
                   "error": "error",
                 })
-            ),
+            )
         ],
         internal_server_error_response(),
         true
     );
 }
 
-fn empty_mock_vec() -> Vec<(httpmock::Method, &'static str, serde_json::Value)> {
+const fn empty_mock_vec() -> Vec<(httpmock::Method, &'static str, serde_json::Value)> {
     vec![]
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "Integration test with comprehensive setup and assertions")]
 async fn handle_vote_channel_test() {
     let custom_uuid = "df4db2bc-9fd1-43fb-8e17-97170379159a";
     let dm_channel_id = "319674150115610528";
@@ -314,19 +316,19 @@ async fn handle_vote_channel_test() {
     let creator_message_id = "812746127846424";
 
     let voting = dd_discord::db::Voting {
-        id: "4712947128794".to_string(),
+        id: "4712947128794".to_owned(),
         choices: vec![
-            "Spinoza".to_string(),
-            "Kant".to_string(),
-            "Nietzsche".to_string(),
+            "Spinoza".to_owned(),
+            "Kant".to_owned(),
+            "Nietzsche".to_owned(),
         ],
-        channel_id: "1187315505103638638".to_string(),
-        message_id: "3589723985723".to_string(),
-        name: "Who do you prefer?".to_string(),
+        channel_id: "1187315505103638638".to_owned(),
+        message_id: "3589723985723".to_owned(),
+        name: "Who do you prefer?".to_owned(),
         is_completed: false,
         is_deleted: false,
-        creator_message_id: creator_message_id.to_string(),
-        creator_dm_channel_id: dm_channel_id.to_string(),
+        creator_message_id: creator_message_id.to_owned(),
+        creator_dm_channel_id: dm_channel_id.to_owned(),
     };
 
     let test = setup_test_env("vote_channel.json");
@@ -359,7 +361,7 @@ async fn handle_vote_channel_test() {
                 },
             ),
             (
-                custom_uuid.to_string(),
+                custom_uuid.to_owned(),
                 CustomID {
                     action: Action::VoteFromChannel,
                     voting_id: voting.id.clone(),
@@ -376,7 +378,7 @@ async fn handle_vote_channel_test() {
         vec![
             (
                 POST,
-                "/api/v10/users/@me/channels".to_string(),
+                "/api/v10/users/@me/channels".to_owned(),
                 json!({
                   "id": dm_channel_id,
                   "type": 1,
@@ -394,7 +396,7 @@ async fn handle_vote_channel_test() {
             ),
             (
                 POST,
-                format!("/api/v10/channels/{}/messages", dm_channel_id),
+                format!("/api/v10/channels/{dm_channel_id}/messages"),
                 json!({
                             "attachments": [],
                             "author": {
@@ -426,10 +428,10 @@ async fn handle_vote_channel_test() {
       &test,
      empty_mock_vec(),
      discord_client_happy_mocks(),
-      Ok((http::StatusCode::OK, Json(InteractionResponse{
+      Ok((StatusCode::OK, Json(InteractionResponse{
         kind: twilight_model::http::interaction::InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some("You will receive dm with voting dialog".to_string()),
+            content: Some("You will receive dm with voting dialog".to_owned()),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -440,16 +442,10 @@ async fn handle_vote_channel_test() {
     let timeout_duration = Duration::from_secs(5);
 
     let voting_dialog = loop {
-        match test.data.db.get_voting_dialog(&voting.id, user_id).await {
-            Ok(voting_dialog) => break voting_dialog,
-            Err(_) => {
-                if start.elapsed() > timeout_duration {
-                    panic!("get voting dialog timeout");
-                }
+        if let Ok(voting_dialog) = test.data.db.get_voting_dialog(&voting.id, user_id).await { break voting_dialog }
+        assert!((start.elapsed() <= timeout_duration), "get voting dialog timeout");
 
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
     assert_eq!(voting_dialog.voting_id, voting.id);
@@ -465,7 +461,7 @@ async fn handle_vote_channel_test() {
 
 fn create_dd_client_server() -> (MockServer, ddclient_rs::Client) {
     let mock_server = MockServer::start();
-    let dd_client = ddclient_rs::Client::builder("dd_token".to_string())
+    let dd_client = ddclient_rs::Client::builder("dd_token".to_owned())
         .api_url(mock_server.base_url())
         .build();
 
@@ -476,7 +472,7 @@ fn create_discord_client_server() -> (MockServer, twilight_http::Client) {
     let mock_server = MockServer::start();
     let base_url = mock_server.base_url().replace("http://", "");
     let discord_client = twilight_http::Client::builder()
-        .token("bot_token".to_string())
+        .token("bot_token".to_owned())
         .proxy(base_url, true)
         .build();
 
@@ -484,7 +480,7 @@ fn create_discord_client_server() -> (MockServer, twilight_http::Client) {
 }
 
 struct TestEnvironment {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "DropDb must be held to prevent cleanup until test ends")]
     drop_db: DropDb,
     dd_server: MockServer,
     discord_server: MockServer,
@@ -496,7 +492,7 @@ struct TestEnvironment {
 fn setup_test_env(filename: &str) -> TestEnvironment {
     let filename = format!("{}/{}", "tests/data", filename);
     let body = fs::read_to_string(filename).expect("Failed to read file");
-    let (_drop_db, db) = create_test_db();
+    let (drop_db, db) = create_test_db();
     let (dd_server, dd_client) = create_dd_client_server();
     let (discord_server, discord_client) = create_discord_client_server();
 
@@ -509,10 +505,10 @@ fn setup_test_env(filename: &str) -> TestEnvironment {
     ));
 
     TestEnvironment {
-        drop_db: _drop_db,
+        drop_db,
         dd_server,
         discord_server,
-        body: body.to_string(),
+        body,
         data: app_state,
         headers,
     }
@@ -522,7 +518,7 @@ fn signing_headers(body: &str) -> (http::HeaderMap, String) {
     let mut csprng = OsRng;
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
 
-    let timestamp = "timestamp".to_string();
+    let timestamp = "timestamp".to_owned();
     let mut signing_buff = timestamp.as_bytes().to_vec();
     signing_buff.extend_from_slice(body.as_bytes());
 
@@ -538,12 +534,12 @@ fn signing_headers(body: &str) -> (http::HeaderMap, String) {
     (headers, public_key)
 }
 
-fn internal_server_error_response() -> dd_discord::InteractionResult {
+const fn internal_server_error_response() -> dd_discord::InteractionResult {
     Err(InteractionError::InternalServerError)
 }
 
 // this can be used for debugging tests
-#[allow(dead_code)]
+#[expect(dead_code, reason = "Debug helper function kept for test troubleshooting")]
 fn setup_tracing() {
     tracing_subscriber::fmt()
         .with_test_writer()

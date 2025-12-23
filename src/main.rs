@@ -40,7 +40,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", post(dd_discord::handle_interaction))
-        .with_state(app_state.clone());
+        .with_state(std::sync::Arc::<dd_discord::AppState>::clone(&app_state));
 
     dd_discord::util::register_voting_command(&bot_token, &discord_register_url, MAX_CHOICES).await;
 
@@ -53,9 +53,10 @@ async fn main() {
 
             app_state.task_tracker.close();
 
-            match time::timeout(Duration::from_secs(10), app_state.task_tracker.wait()).await {
-                Ok(_) => tracing::info!("All tasks finished cleanly."),
-                Err(_) => tracing::info!("Timed out waiting for tasks to finish."),
+            if time::timeout(Duration::from_secs(10), app_state.task_tracker.wait()).await.is_ok() {
+                tracing::info!("All tasks finished cleanly.");
+            } else {
+                tracing::info!("Timed out waiting for tasks to finish.");
             }
         })
         .await

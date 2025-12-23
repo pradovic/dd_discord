@@ -15,7 +15,7 @@ pub async fn register_voting_command(token: &str, api_url: &str, max_choices: us
 
     for i in 2..=max_choices {
         cmd = cmd.option(
-            StringBuilder::new(format!("choice{}", i), format!("The {}th choice", i))
+            StringBuilder::new(format!("choice{i}"), format!("The {i}th choice"))
                 .required(false),
         );
     }
@@ -23,7 +23,7 @@ pub async fn register_voting_command(token: &str, api_url: &str, max_choices: us
     let client = reqwest::Client::new();
     let resp = client
         .request(Method::POST, api_url)
-        .header("Authorization", format!("Bot {}", token))
+        .header("Authorization", format!("Bot {token}"))
         .json(&cmd.build())
         .send()
         .await
@@ -34,13 +34,13 @@ pub async fn register_voting_command(token: &str, api_url: &str, max_choices: us
 
 // verify the signature of a request
 // Return simple string error because the usage is simple, we just want to log the error
-pub fn verify_signature(headers: HeaderMap, body: String, public_key: &str) -> Result<(), String> {
+pub fn verify_signature(headers: &HeaderMap, body: &str, public_key: &str) -> Result<(), String> {
     let Some(signature) = headers.get("X-Signature-Ed25519") else {
-        return Err("missing signature header".to_string());
+        return Err("missing signature header".to_owned());
     };
 
     let Some(timestamp) = headers.get("X-Signature-Timestamp") else {
-        return Err("missing timestamp header".to_string());
+        return Err("missing timestamp header".to_owned());
     };
 
     let signature = hex::decode(signature.as_bytes()).map_err(|err| err.to_string())?;
@@ -61,6 +61,7 @@ pub fn verify_signature(headers: HeaderMap, body: String, public_key: &str) -> R
     Ok(())
 }
 
+#[must_use]
 pub fn generate_random_custom_uuid() -> String {
     Uuid::new_v4().to_string()
 }

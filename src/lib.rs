@@ -9,6 +9,7 @@ use axum::Json;
 use ddclient_rs::Client;
 use http::{HeaderMap, StatusCode};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio_util::task::TaskTracker;
 use twilight_model::application::interaction::application_command::{
@@ -38,6 +39,7 @@ pub struct AppState {
     pub task_tracker: TaskTracker,
 }
 
+#[must_use]
 pub fn new_app_state(
     db: Db,
     discord_client: twilight_http::Client,
@@ -64,7 +66,7 @@ pub async fn handle_interaction(
     })?;
 
     tracing::debug!(?interaction, "received interaction");
-    util::verify_signature(headers, body, &data.discord_public_key).map_err(|err| {
+    util::verify_signature(&headers, &body, &data.discord_public_key).map_err(|err| {
         tracing::error!(error = ?err,"verifying signature failed");
         InteractionError::Status(StatusCode::UNAUTHORIZED)
     })?;
@@ -86,7 +88,7 @@ pub async fn handle_interaction(
             };
 
             match command.name.as_str() {
-                "ping" => handle_ping(),
+                "ping" => Ok(handle_ping()),
                 "voting" => handle_slash_voting(&data, command, &interaction).await,
                 _ => {
                     tracing::error!(data = ?interaction.data, "Application command not handled");
@@ -104,7 +106,7 @@ pub async fn handle_interaction(
             let Ok(custom_id) = data.db.get_custom_id(&command.custom_id).await else {
                 // this can happen with lingering dialogs while completing or deleting voting
                 tracing::info!(data = ?interaction.data, "received interaction with unknown custom id");
-                return ack_response();
+                return Ok(ack_response());
             };
 
             match &custom_id.action {
@@ -117,8 +119,9 @@ pub async fn handle_interaction(
                 Action::VoteSelect => {
                     handle_vote_select(&data, &interaction, command, &custom_id).await
                 }
-                Action::VoteNext => handle_vote_page(data, &interaction, &custom_id).await,
-                Action::VotePrevious => handle_vote_page(data, &interaction, &custom_id).await,
+                Action::VoteNext | Action::VotePrevious => {
+                    handle_vote_page(data, &interaction, &custom_id).await
+                }
                 Action::Complete => {
                     handle_complete_voting(&data, &interaction, &custom_id.voting_id).await
                 }
@@ -153,7 +156,7 @@ async fn handle_vote_page(
 
     // this can happen with lingering dialogs while completing or deleting voting
     if voting.is_deleted || voting.is_completed {
-        return ack_response();
+        return Ok(ack_response());
     }
 
     let Some(ref user) = interaction.user else {
@@ -168,7 +171,7 @@ async fn handle_vote_page(
     {
         Ok(v) => v,
         Err(db::DbError::NotFound) => {
-            return ack_response();
+            return Ok(ack_response());
         }
         Err(err) => {
             tracing::error!(%voting_id, error = ?err, data = ?interaction.data, "getting voting dialog from db failed");
@@ -177,7 +180,7 @@ async fn handle_vote_page(
     };
 
     let (title, components, custom_ids) =
-        create_vote_components(voting_id, voting, page, voting_dialog.ballot);
+        create_vote_components(voting_id, &voting, page, &voting_dialog.ballot);
     data.db
         .bulk_save_custom_ids(custom_ids)
         .await
@@ -206,9 +209,10 @@ async fn handle_vote_page(
     )
     .await?;
 
-    ack_response()
+    Ok(ack_response())
 }
 
+#[expect(clippy::too_many_lines, reason = "Complex voting completion with result calculation and message updates")]
 async fn handle_complete_voting(
     data: &Arc<AppState>,
     interaction: &Interaction,
@@ -227,7 +231,7 @@ async fn handle_complete_voting(
         Ok(v) => v,
         Err(db::DbError::NotFound) => {
             // this can happen during delete
-            return ack_response();
+            return Ok(ack_response());
         }
         Err(err) => {
             tracing::error!(%voting_id, error = ?err, data = ?interaction.data, "completing voting in db failed");
@@ -235,69 +239,71 @@ async fn handle_complete_voting(
         }
     };
 
-    let description = if results.tie {
-        "Its a tie!"
+    let (description, color) = if results.tie {
+        (
+            "\u{1f91d} **It's a tie!** No clear winner emerged.".to_owned(),
+            0x00FE_E75C,
+        ) // Yellow
     } else {
-        "Voting results were calculated using Shultze method. The users are ranked by winning percentages."
+        (
+            "Results calculated using the **Schulze method**\n\
+            Ranked by winning percentages against other choices."
+                .to_owned(),
+            0x0057_F287, // Green
+        )
     };
 
-    let mut fields = Vec::new();
-    for result in &results.results {
-        let field_text = format!(
-            "Wins: {}, Percentage: {:.2}%",
-            result.wins, result.percentage
+    // Build ranking with medals for top 3
+    let mut ranking_text = String::new();
+    for (i, result) in results.results.iter().enumerate() {
+        let medal = match i {
+            0 => "\u{1f947}",
+            1 => "\u{1f948}",
+            2 => "\u{1f949}",
+            _ => "\u{25ab}\u{fe0f}",
+        };
+        let _ = writeln!(
+            ranking_text,
+            "{medal} **{}** \u{2014} {:.1}% wins ({} victories)",
+            result.choice, result.percentage, result.wins
         );
-        fields.push(EmbedFieldBuilder::new(&result.choice, field_text).build());
     }
 
-    let mut result_embed = EmbedBuilder::new()
-        .title(voting.name.clone())
-        .description(description);
-
-    for field in fields {
-        result_embed = result_embed.field(field);
-    }
+    let result_embed = EmbedBuilder::new()
+        .title(format!("\u{1f3c6}  Results: {}", voting.name))
+        .description(format!("{description}\n\n{ranking_text}"))
+        .color(color);
 
     let mut result_embeds = vec![result_embed.build()];
 
     if let Some(duels) = results.duels {
         if !duels.is_empty() && !results.tie {
-            let mut duels_fields = Vec::new();
+            let mut duels_text = String::new();
             for duel in duels {
-                let message;
-                if duel.left.strength == duel.right.strength {
-                    message = format!(
-                        "**{}** and **{}** are tied",
+                let message = if duel.left.strength == duel.right.strength {
+                    format!(
+                        "\u{2696}\u{fe0f} {} vs {} \u{2014} **Tied**",
                         duel.left.choice, duel.right.choice
-                    );
+                    )
                 } else {
-                    let left;
-                    let right;
-                    if duel.left.strength > duel.right.strength {
-                        left = duel.left;
-                        right = duel.right;
+                    let (winner, loser) = if duel.left.strength > duel.right.strength {
+                        (duel.left, duel.right)
                     } else {
-                        left = duel.right;
-                        right = duel.left;
-                    }
+                        (duel.right, duel.left)
+                    };
 
-                    message = format!(
-                        "**{}** defeats **{}** by ({} - {}) = {} votes",
-                        left.choice,
-                        right.choice,
-                        left.strength,
-                        right.strength,
-                        left.strength - right.strength
-                    );
-                }
-                duels_fields.push(EmbedFieldBuilder::new("", &message).build());
+                    format!(
+                        "\u{2713} {} > {} ({}-{})",
+                        winner.choice, loser.choice, winner.strength, loser.strength
+                    )
+                };
+                let _ = writeln!(duels_text, "{message}");
             }
 
-            let mut duels_embed = EmbedBuilder::new().title("Result breakdown");
-
-            for field in duels_fields {
-                duels_embed = duels_embed.field(field);
-            }
+            let duels_embed = EmbedBuilder::new()
+                .title("\u{1f4ca}  Head-to-Head Breakdown")
+                .description(duels_text)
+                .color(0x0058_65F2); // Discord blurple
 
             result_embeds.push(duels_embed.build());
         }
@@ -364,10 +370,10 @@ async fn handle_complete_voting(
     )
     .await?;
 
-    let data_clone = data.clone();
-    spawn_clean_voting_dialogs(voting, data_clone, "Voting completed".to_string());
+    let data_clone = Arc::<AppState>::clone(data);
+    spawn_clean_voting_dialogs(voting, data_clone, "Voting completed".to_owned());
 
-    ack_response()
+    Ok(ack_response())
 }
 
 async fn handle_delete_voting(
@@ -379,7 +385,7 @@ async fn handle_delete_voting(
         Ok(v) => v,
         Err(db::DbError::NotFound) => {
             // handle double click or complete already in progress
-            return ack_response();
+            return Ok(ack_response());
         }
         Err(err) => {
             tracing::error!(%voting_id, error = ?err, data = ?interaction.data, "deleting voting from db failed");
@@ -445,14 +451,14 @@ async fn handle_delete_voting(
     )
     .await?;
 
-    let data_clone = data.clone();
-    spawn_clean_voting_dialogs(voting, data_clone, "Voting deleted".to_string());
+    let data_clone = Arc::<AppState>::clone(data);
+    spawn_clean_voting_dialogs(voting, data_clone, "Voting deleted".to_owned());
 
-    ack_response()
+    Ok(ack_response())
 }
 
 fn spawn_clean_voting_dialogs(voting: Voting, data_clone: Arc<AppState>, message: String) {
-    let data = data_clone.clone();
+    let data = Arc::<AppState>::clone(&data_clone);
     data.task_tracker.spawn(async move {
         if let Ok(dialogs) = data_clone.db.get_voting_dialogs(voting.id.as_str()).await {
             for dialog in dialogs {
@@ -485,7 +491,7 @@ fn spawn_clean_voting_dialogs(voting: Voting, data_clone: Arc<AppState>, message
                     .delete_voting_dialog(&dialog.voting_id, &dialog.user_id)
                     .await
                 {
-                    tracing::error!(error = ?err, "deleting voting dialog from db failed")
+                    tracing::error!(error = ?err, "deleting voting dialog from db failed");
                 }
             }
         }
@@ -513,7 +519,7 @@ async fn handle_dm_vote(
 
     // this can happen with lingering dialogs while completing or deleting voting
     if voting.is_deleted || voting.is_completed {
-        return ack_response();
+        return Ok(ack_response());
     }
 
     let voting_dialog = match data
@@ -523,7 +529,7 @@ async fn handle_dm_vote(
     {
         Ok(v) => v,
         Err(db::DbError::NotFound) => {
-            return ack_response();
+            return Ok(ack_response());
         }
         Err(err) => {
             tracing::error!(%voting_id, error = ?err, data = ?interaction.data, "getting voting dialog from db failed");
@@ -574,7 +580,7 @@ async fn handle_dm_vote(
                     InteractionError::InternalServerError
                 })?;
 
-    ack_response()
+    Ok(ack_response())
 }
 
 async fn handle_vote_select(
@@ -613,7 +619,7 @@ async fn handle_vote_select(
         InteractionError::InternalServerError
     })?;
 
-    ack_response()
+    Ok(ack_response())
 }
 
 async fn handle_vote_channel(
@@ -628,7 +634,7 @@ async fn handle_vote_channel(
 
     // this can happen with lingering dialogs while completing or deleting voting
     if voting.is_deleted || voting.is_completed {
-        return ack_response();
+        return Ok(ack_response());
     }
 
     let Some(ref member) = interaction.member else {
@@ -644,16 +650,16 @@ async fn handle_vote_channel(
     match data
         .db
         .save_voting_dialog(
-            voting_id.to_string(),
+            voting_id.to_owned(),
             user.id.to_string(),
             Vec::new(),
-            "".to_string(),
-            "".to_string(),
+            String::new(),
+            String::new(),
             false,
         )
         .await
     {
-        Ok(_) => (),
+        Ok(()) => (),
         Err(db::DbError::AlreadyExists) => {
             return Ok((StatusCode::OK, ephemeral_response("You already have voting dialog open or it is being sent to you. If that is not the case, please contact support.")));
         }
@@ -665,7 +671,7 @@ async fn handle_vote_channel(
 
     let ballot: Vec<i32> = vec![0; voting.choices.len()];
     let (title, components, custom_ids) =
-        create_vote_components(voting_id, voting, 1, ballot.clone());
+        create_vote_components(voting_id, &voting, 1, &ballot);
 
     data.db.bulk_save_custom_ids(custom_ids).await.map_err(|err| {
         tracing::error!(%voting_id, error = ?err, data = ?interaction.data, "bulk saving custom ids into db failed");
@@ -690,7 +696,7 @@ async fn handle_vote_channel(
     data
         .db
         .save_voting_dialog(
-            voting_id.to_string(),
+            voting_id.to_owned(),
             user.id.to_string(),
             ballot.clone(),
             message.id.to_string(),
@@ -706,7 +712,7 @@ async fn handle_vote_channel(
     let response = Json(InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some("You will receive dm with voting dialog".to_string()),
+            content: Some("You will receive dm with voting dialog".to_owned()),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -715,33 +721,52 @@ async fn handle_vote_channel(
     Ok((StatusCode::OK, response))
 }
 
+#[expect(clippy::too_many_lines, reason = "Building paginated voting UI with multiple components")]
 fn create_vote_components(
     voting_id: &str,
-    voting: Voting,
+    voting: &Voting,
     page: usize,
-    ballot: Vec<i32>,
+    ballot: &[i32],
 ) -> (Vec<Embed>, Vec<Component>, Vec<(String, CustomID)>) {
     let page_size = 4;
-    let total_pages = (voting.choices.len() + page_size - 1) / page_size;
+    let total_pages = voting.choices.len().div_ceil(page_size);
     let start = (page - 1) * page_size;
     let end = usize::min(start + page_size, voting.choices.len());
 
     let paginated_choices = voting.choices[start..end]
         .iter()
         .enumerate()
-        .map(|(i, choice)| format!("**{}**: {}", start + i + 1, choice))
+        .map(|(i, choice)| {
+            let rank = ballot.get(i + start).copied().unwrap_or(0);
+            let rank_display = if rank == 0 {
+"\u{2b1c}".to_owned()
+            } else {
+                format!("**[{rank}]**")
+            };
+            format!("{rank_display} **{}**. {choice}", start + i + 1)
+        })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
 
-    let embed_title = if voting.choices.len() > page_size {
-        format!("Voting Choices - Page {} of {}", page, total_pages)
+    let embed_title = format!("\u{1f5f3}\u{fe0f}  {}", voting.name);
+
+    let page_info = if voting.choices.len() > page_size {
+        format!("Page {page}/{total_pages}")
     } else {
-        "Voting Choices".to_string()
+        String::new()
     };
+
+    let description = format!(
+        "**Rank each choice** (1 = most preferred)\n\
+        Lower numbers = higher preference\n\n\
+        {paginated_choices}\n\n\
+        {page_info}"
+    );
 
     let title = EmbedBuilder::new()
         .title(embed_title)
-        .description(paginated_choices)
+        .description(description)
+        .color(0x0058_65F2) // Discord blurple
         .build();
 
     let options: Vec<SelectMenuOption> = (1..=voting.choices.len())
@@ -760,15 +785,17 @@ fn create_vote_components(
         .iter()
         .enumerate()
         .map(|(i, _)| {
-            let placeholder = match ballot[i + start] {
-                0 => "Select".to_string(),
-                _ => ballot[i + start].to_string(),
+            let ballot_value = ballot.get(i + start).copied().unwrap_or(0);
+            let placeholder = if ballot_value == 0 {
+                "Select".to_owned()
+            } else {
+                ballot_value.to_string()
             };
 
             let custom_uuid = util::generate_random_custom_uuid();
             let custom_id = CustomID {
                 action: Action::VoteSelect,
-                voting_id: voting_id.to_string(),
+                voting_id: voting_id.to_owned(),
                 user_id: None,
                 page: None,
                 index: Some(i + start),
@@ -799,7 +826,7 @@ fn create_vote_components(
             custom_uuid.clone(),
             CustomID {
                 action: Action::VotePrevious,
-                voting_id: voting_id.to_string(),
+                voting_id: voting_id.to_owned(),
                 user_id: None,
                 page: Some(page - 1),
                 index: None,
@@ -809,8 +836,10 @@ fn create_vote_components(
         btns.push(Component::Button(Button {
             custom_id: Some(custom_uuid),
             disabled: false,
-            emoji: None,
-            label: Some("Previous".to_string()),
+            emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+                name: "\u{25c0}\u{fe0f}".to_owned(),
+            }),
+            label: Some("Previous".to_owned()),
             style: ButtonStyle::Secondary,
             url: None,
         }));
@@ -822,7 +851,7 @@ fn create_vote_components(
             custom_uuid.clone(),
             CustomID {
                 action: Action::VoteNext,
-                voting_id: voting_id.to_string(),
+                voting_id: voting_id.to_owned(),
                 user_id: None,
                 page: Some(page + 1),
                 index: None,
@@ -832,11 +861,13 @@ fn create_vote_components(
         btns.push(Component::Button(Button {
             custom_id: Some(custom_uuid),
             disabled: false,
-            emoji: None,
-            label: Some("Next".to_string()),
+            emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+                name: "\u{25b6}\u{fe0f}".to_owned(),
+            }),
+            label: Some("Next".to_owned()),
             style: ButtonStyle::Secondary,
             url: None,
-        }))
+        }));
     }
 
     if page == total_pages {
@@ -845,7 +876,7 @@ fn create_vote_components(
             custom_uuid.clone(),
             CustomID {
                 action: Action::VoteFromDM,
-                voting_id: voting_id.to_string(),
+                voting_id: voting_id.to_owned(),
                 user_id: None,
                 page: None,
                 index: None,
@@ -854,11 +885,13 @@ fn create_vote_components(
         btns.push(Component::Button(Button {
             custom_id: Some(custom_uuid),
             disabled: false,
-            emoji: None,
-            label: Some("Vote".to_string()),
-            style: ButtonStyle::Primary,
+            emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+                name: "\u{2705}".to_owned(),
+            }),
+            label: Some("Submit Vote".to_owned()),
+            style: ButtonStyle::Success,
             url: None,
-        }))
+        }));
     }
 
     if !btns.is_empty() {
@@ -868,6 +901,7 @@ fn create_vote_components(
     (vec![title], components, custom_ids)
 }
 
+#[expect(clippy::too_many_lines, reason = "Handles voting creation with DM to creator and channel announcement")]
 async fn handle_slash_voting(
     data: &Arc<AppState>,
     command: &CommandData,
@@ -937,10 +971,24 @@ async fn handle_slash_voting(
             InteractionError::InternalServerError
         })?;
 
+    // Format choices with numbers for creator view
+    let choices_numbered = choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}. {c}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let embeds = vec![EmbedBuilder::new()
-        .title(format!("Voting Created: {}", name))
-        .description("Your voting has been successfully created. The results will be published once the voting is completed.")
-        .field(EmbedFieldBuilder::new("Choices", choices.join("\n")))
+        .title(format!("Your Voting: {name}"))
+        .description(format!(
+            "Your voting is now **active** and ready for participants!\n\n\
+            **Choices:**\n{choices_numbered}\n\n\
+            Use the buttons below to manage your voting."
+        ))
+        .color(0x0057_F287) // Green
+        .field(EmbedFieldBuilder::new("Complete", "End the voting and publish results").inline())
+        .field(EmbedFieldBuilder::new("Delete", "Cancel the voting entirely").inline())
         .build()];
 
     let mut custom_ids = Vec::new();
@@ -959,9 +1007,11 @@ async fn handle_slash_voting(
     let complete_btn = Button {
         custom_id: Some(custom_uuid),
         disabled: false,
-        emoji: None,
-        label: Some("Complete Voting".to_string()),
-        style: ButtonStyle::Primary,
+        emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+            name: "\u{2705}".to_owned(),
+        }),
+        label: Some("Complete Voting".to_owned()),
+        style: ButtonStyle::Success,
         url: None,
     };
 
@@ -979,8 +1029,10 @@ async fn handle_slash_voting(
     let delete_btn = Button {
         custom_id: Some(custom_uuid),
         disabled: false,
-        emoji: None,
-        label: Some("Delete Voting".to_string()),
+        emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+            name: "\u{1f5d1}\u{fe0f}".to_owned(),
+        }),
+        label: Some("Delete Voting".to_owned()),
         style: ButtonStyle::Danger,
         url: None,
     };
@@ -998,13 +1050,24 @@ async fn handle_slash_voting(
             .id
             .to_string();
 
+    // Format choices with bullet points
+    let choices_formatted = choices
+        .iter()
+        .map(|c| format!("- {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let embeds = vec![EmbedBuilder::new()
-        .title(format!(
-            "Created a voting with name:{}, id: {} and choices: {:?}",
-            name, voting.id, voting.choices
+        .title(name.clone())
+        .description(format!(
+            "**Cast your vote using preferential ranking!**\n\n\
+            Rank your choices from most to least preferred.\n\
+            Results are calculated using the Schulze method.\n\n\
+            **Choices:**\n{}\n\n\
+            _Created by {}_",
+            choices_formatted, user.name
         ))
-        .description("Click vote button when you are ready to vote. The voting will be done in dm.")
-        .field(EmbedFieldBuilder::new("Choices", choices.join("\n")))
+        .color(0x0058_65F2) // Discord blurple
         .build()];
 
     let custom_uuid = util::generate_random_custom_uuid();
@@ -1019,9 +1082,11 @@ async fn handle_slash_voting(
     let vote_btn = Button {
         custom_id: Some(custom_uuid.clone()),
         disabled: false,
-        emoji: None,
-        label: Some("Vote".to_string()),
-        style: ButtonStyle::Primary,
+        emoji: Some(twilight_model::channel::message::ReactionType::Unicode {
+            name: "\u{1f5f3}\u{fe0f}".to_owned(),
+        }),
+        label: Some("Vote Now".to_owned()),
+        style: ButtonStyle::Success,
         url: None,
     };
 
@@ -1046,7 +1111,7 @@ async fn handle_slash_voting(
     data.db
         .save_voting(Voting {
             id: voting.id.clone(),
-            name: name.to_string(),
+            name: name.clone(),
             choices: choices.clone(),
             is_completed: false,
             is_deleted: false,
@@ -1061,43 +1126,43 @@ async fn handle_slash_voting(
             InteractionError::InternalServerError
         })?;
 
-    ack_response()
+    Ok(ack_response())
 }
 
-fn handle_ping() -> InteractionResult {
+fn handle_ping() -> (StatusCode, Json<InteractionResponse>) {
     let pong = Json(InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some("pong".to_string()),
+            content: Some("pong".to_owned()),
             ..Default::default()
         }),
     });
 
-    Ok((StatusCode::OK, pong))
+    (StatusCode::OK, pong)
 }
 
 fn ephemeral_response(message: &str) -> Json<InteractionResponse> {
     Json(InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some(message.to_string()),
+            content: Some(message.to_owned()),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
     })
 }
 
-fn ack_response() -> InteractionResult {
-    Ok((
+const fn ack_response() -> (StatusCode, Json<InteractionResponse>) {
+    (
         StatusCode::OK,
         Json(InteractionResponse {
             kind: InteractionResponseType::ChannelMessageWithSource,
             data: None,
         }),
-    ))
+    )
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum InteractionError {
     Status(StatusCode),
     InternalServerError,
@@ -1106,8 +1171,8 @@ pub enum InteractionError {
 impl IntoResponse for InteractionError {
     fn into_response(self) -> Response {
         match self {
-            InteractionError::Status(status) => (status, "").into_response(),
-            InteractionError::InternalServerError => (
+            Self::Status(status) => (status, "").into_response(),
+            Self::InternalServerError => (
                 StatusCode::OK,
                 ephemeral_response("Ouch, something went wrong. Please try again later."),
             )

@@ -1,6 +1,8 @@
-use redb::{CommitError, Database, ReadableTable, StorageError, TableDefinition, TransactionError};
+use redb::{
+    CommitError, Database, ReadableTable as _, StorageError, TableDefinition, TransactionError,
+};
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 use tokio::task::JoinError;
 
 // <votingID, votingJson>
@@ -18,12 +20,13 @@ pub struct Db {
     pub db: Arc<Database>,
 }
 
+#[must_use]
 pub fn new() -> Db {
     let db = Database::create("voting.redb").expect("failed to create database");
     Db { db: Arc::new(db) }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct Voting {
     pub id: String,
     pub name: String,
@@ -50,7 +53,7 @@ impl From<&Voting> for String {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VoteDialog {
     pub voting_id: String,
     pub user_id: String,
@@ -73,7 +76,7 @@ impl From<&VoteDialog> for String {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Clone)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, Clone)]
 pub struct CustomID {
     pub action: Action,
     pub voting_id: String,
@@ -85,9 +88,9 @@ pub struct CustomID {
     pub index: Option<usize>,
 }
 
-impl ToString for CustomID {
-    fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
+impl Display for CustomID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", serde_json::to_string(self).unwrap())
     }
 }
 
@@ -99,7 +102,7 @@ impl TryFrom<&str> for CustomID {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Clone)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, Clone)]
 pub enum Action {
     VoteFromChannel,
     VoteFromDM,
@@ -110,7 +113,7 @@ pub enum Action {
     Delete,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DbError {
     NotFound,
     IndexOutOfRange,
@@ -121,40 +124,40 @@ pub enum DbError {
 impl From<redb::TableError> for DbError {
     fn from(e: redb::TableError) -> Self {
         if let redb::TableError::TableDoesNotExist(_) = e {
-            DbError::NotFound
+            Self::NotFound
         } else {
-            DbError::Other(e.to_string())
+            Self::Other(e.to_string())
         }
     }
 }
 
 impl From<redb::Error> for DbError {
     fn from(e: redb::Error) -> Self {
-        DbError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
 impl From<TransactionError> for DbError {
     fn from(e: TransactionError) -> Self {
-        DbError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
 impl From<CommitError> for DbError {
     fn from(e: CommitError) -> Self {
-        DbError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
 impl From<StorageError> for DbError {
     fn from(e: StorageError) -> Self {
-        DbError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
 impl From<JoinError> for DbError {
     fn from(e: JoinError) -> Self {
-        DbError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
@@ -162,7 +165,7 @@ impl Db {
     // Saves voting to the database.
     // Returns `AlreadyExists` if the voting with the same id already exists.
     pub async fn save_voting(&self, voting: Voting) -> Result<(), DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let write_txn = db.begin_write()?;
@@ -173,7 +176,7 @@ impl Db {
                     return Err(DbError::AlreadyExists);
                 }
                 table.insert(voting.id.clone().as_str(), String::from(&voting).as_str())?;
-            }
+            };
 
             write_txn.commit()?;
 
@@ -185,7 +188,7 @@ impl Db {
     // Marks voting as completed.
     // Returns `NotFound` if the voting is not found, or if it was marked as deleted.
     pub async fn complete_voting(&self, id: &str) -> Result<Voting, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let id = id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -208,7 +211,7 @@ impl Db {
                     {
                         let mut table = write_txn.open_table(VOTING_TABLE)?;
                         table.insert(id.as_str(), String::from(&voting).as_str())?;
-                    }
+                    };
 
                     write_txn.commit()?;
                     Ok(voting)
@@ -220,7 +223,7 @@ impl Db {
     }
 
     pub async fn delete_voting(&self, id: &str) -> Result<Voting, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let id = id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -243,7 +246,7 @@ impl Db {
                     {
                         let mut table = write_txn.open_table(VOTING_TABLE)?;
                         table.insert(id.as_str(), String::from(&voting).as_str())?;
-                    }
+                    };
 
                     write_txn.commit()?;
                     Ok(voting)
@@ -258,7 +261,7 @@ impl Db {
     // Voting marked as deleted or completed are returned successfully.
     // It is up to the caller to check the state of the voting
     pub async fn get_voting(&self, id: &str) -> Result<Voting, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let id = id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -288,7 +291,7 @@ impl Db {
         index: usize,
     ) -> Result<(), DbError> {
         let id = encode_key(voting_id, user_id);
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let read_txn = db.begin_read()?;
@@ -309,7 +312,7 @@ impl Db {
                     {
                         let mut table = write_txn.open_table(VOTING_DIALOG_TABLE)?;
                         table.insert(id.as_str(), String::from(&voting_dialog).as_str())?;
-                    }
+                    };
 
                     write_txn.commit()?;
                     Ok(())
@@ -341,7 +344,7 @@ impl Db {
             channel_id,
         };
 
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let write_txn = db.begin_write()?;
@@ -353,7 +356,7 @@ impl Db {
                 }
 
                 table.insert(id.as_str(), String::from(&dialog).as_str())?;
-            }
+            };
 
             write_txn.commit()?;
 
@@ -369,7 +372,7 @@ impl Db {
         user_id: &str,
     ) -> Result<VoteDialog, DbError> {
         let id = encode_key(voting_id, user_id);
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let read_txn = db.begin_read()?;
@@ -388,7 +391,7 @@ impl Db {
     }
 
     pub async fn get_voting_dialogs(&self, voting_id: &str) -> Result<Vec<VoteDialog>, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let voting_id = voting_id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -396,7 +399,7 @@ impl Db {
 
             let table = read_txn.open_table(VOTING_DIALOG_TABLE)?;
 
-            let res = table.range(format!("{}{}", voting_id, ENCODE_DELIMITER).as_str()..)?;
+            let res = table.range(format!("{voting_id}{ENCODE_DELIMITER}").as_str()..)?;
 
             let mut dialogs = vec![];
             for v in res.flatten() {
@@ -418,14 +421,14 @@ impl Db {
         user_id: &str,
     ) -> Result<(), DbError> {
         let id = encode_key(voting_id, user_id);
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let write_txn = db.begin_write()?;
             {
                 let mut table = write_txn.open_table(VOTING_DIALOG_TABLE)?;
                 table.remove(id.as_str())?;
-            }
+            };
 
             write_txn.commit()?;
 
@@ -439,7 +442,7 @@ impl Db {
         &self,
         custom_ids: Vec<(String, CustomID)>,
     ) -> Result<(), DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
 
         tokio::task::spawn_blocking(move || {
             let write_txn = db.begin_write()?;
@@ -463,7 +466,7 @@ impl Db {
     }
 
     pub async fn get_custom_id(&self, id: &str) -> Result<CustomID, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let id = id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -482,9 +485,8 @@ impl Db {
         .map_err(|e| DbError::Other(e.to_string()))?
     }
 
-    #[allow(dead_code)]
     pub async fn get_custom_ids(&self, voting_id: &str) -> Result<Vec<CustomID>, DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let voting_id = voting_id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -494,7 +496,7 @@ impl Db {
 
             let table_index = read_txn.open_table(VOTING_CUSTOMID_INDEX_TABLE)?;
 
-            let index_prefix = format!("{}{}", voting_id, ENCODE_DELIMITER);
+            let index_prefix = format!("{voting_id}{ENCODE_DELIMITER}");
 
             let res = table_index.range(index_prefix.as_str()..)?;
 
@@ -523,7 +525,7 @@ impl Db {
     }
 
     pub async fn delete_custom_ids(&self, voting_id: &str) -> Result<(), DbError> {
-        let db = self.db.clone();
+        let db = Arc::<Database>::clone(&self.db);
         let voting_id = voting_id.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -533,7 +535,7 @@ impl Db {
 
                 let mut index_table = write_txn.open_table(VOTING_CUSTOMID_INDEX_TABLE)?;
 
-                let index_prefix = format!("{}{}", voting_id, ENCODE_DELIMITER);
+                let index_prefix = format!("{voting_id}{ENCODE_DELIMITER}");
 
                 let mut to_remove: Vec<(String, String)> = Vec::new();
                 {
@@ -546,7 +548,7 @@ impl Db {
                             break;
                         }
 
-                        to_remove.push((index.to_string(), v.1.value().to_string()));
+                        to_remove.push((index.to_owned(), v.1.value().to_owned()));
                     }
                 }
 
@@ -566,5 +568,5 @@ impl Db {
 }
 
 fn encode_key(voting_id: &str, user_id: &str) -> String {
-    format!("{}{}{}", voting_id, ENCODE_DELIMITER, user_id)
+    format!("{voting_id}{ENCODE_DELIMITER}{user_id}")
 }
